@@ -47,8 +47,7 @@ const (
 	CCEElbNetwork = "HwCloud-CCE-ELB"
 	AliasCCEELB   = "CCE-ELB-Network"
 
-	ElbMappingPoolAnnotationKey = "kubernetes.io/elb.mapping.pool"
-	EnableCCEScatterConfigName  = "kubernetes.io/elb.enable.scatter"
+	EnableCCEScatterConfigName = "kubernetes.io/elb.enable.scatter"
 )
 
 var (

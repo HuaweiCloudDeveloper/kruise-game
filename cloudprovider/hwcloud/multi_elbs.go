@@ -19,6 +19,7 @@ package hwcloud
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +62,17 @@ const (
 	ServiceProxyName         = "service.kubernetes.io/service-proxy-name"
 
 	PublicIPSetAnnotationKey = "game.kruise.io/lb-public-ip-set"
+
+	ElbMappingPoolAnnotationKey = "kubernetes.io/elb.mapping.pool"
+)
+
+var (
+	notAllowedAnnotationKeyMap = map[string]struct{}{
+		"kubernetes.io/elb.autocreate":   {},
+		"kubernetes.io/elb.mapping.pool": {},
+		"kubernetes.io/elb.class":        {},
+		"kubernetes.io/elb.id":           {},
+	}
 )
 
 type MultiElbsPlugin struct {
@@ -511,6 +523,7 @@ func init() {
 
 type multiELBsConfig struct {
 	lbNames               map[string]string
+	hwOptions             map[string]string
 	idList                [][]string
 	targetPorts           []int
 	protocols             []corev1.Protocol
@@ -563,6 +576,9 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 		ElbConfigHashKey:   util.GetHash(conf),
 		//LBHealthCheckFlagAnnotationKey: conf.lBHealthCheckFlag,
 	}
+	// 把所有的其他设置的配置都塞进去
+	maps.Copy(svcAnnotations, conf.hwOptions)
+
 	//if conf.lBHealthCheckFlag == "on" {
 	//	svcAnnotations[LBHealthCheckTypeAnnotationKey] = conf.lBHealthCheckType
 	//	svcAnnotations[LBHealthCheckConnectPortAnnotationKey] = conf.lBHealthCheckConnectPort
@@ -610,6 +626,10 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPorts, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
+
+	if m.podAllocate == nil {
+		return nil, cperrors.NewPluginError(cperrors.ApiCallError, "podAllocate is nil")
+	}
 
 	// check if pod is already allocated
 	if m.podAllocate[nsName] != nil {
@@ -720,6 +740,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 	lbNames := make(map[string]string)
 	idList := make([][]string, 0)
 	nameNums := make(map[string]int)
+	hwOptions := make(map[string]string)
 	ports := make([]int, 0)
 	protocols := make([]corev1.Protocol, 0)
 	isFixed := false
@@ -783,6 +804,12 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 			}
 		case ElbClassConfigName:
 			elbClass = c.Value
+		default:
+			if _, exists := notAllowedAnnotationKeyMap[c.Name]; !exists {
+				hwOptions[c.Name] = c.Value
+			} else {
+				log.Warningf("[%s] not allowed annotation key %s", MultiElbsNetwork, c.Name)
+			}
 		}
 	}
 
@@ -810,6 +837,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 
 	return &multiELBsConfig{
 		lbNames:               lbNames,
+		hwOptions:             hwOptions,
 		idList:                idList,
 		targetPorts:           ports,
 		protocols:             protocols,
