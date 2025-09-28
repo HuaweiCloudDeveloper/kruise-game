@@ -216,6 +216,11 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 		return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 	}
 
+	// 收集需要更新的Service
+	var servicesToUpdate []*corev1.Service
+	var servicesToCreate []*corev1.Service
+	var needNetworkNotReady bool
+
 	for _, lbId := range conf.idList[podLbsPorts.index] {
 		// get svc
 		lbName := conf.lbNames[lbId]
@@ -230,18 +235,61 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 				if err != nil {
 					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 				}
-				err = c.Create(ctx, service)
-				if err != nil {
-					return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
-				}
-				continue
+				servicesToCreate = append(servicesToCreate, service)
+			} else {
+				return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
 			}
+		} else {
+			// old svc remain
+			if svc.OwnerReferences[0].Kind == "Pod" && svc.OwnerReferences[0].UID != pod.UID {
+				log.Infof("[%s] waiting old svc %s/%s deleted. old owner pod uid is %s, but now is %s", "HwCloud-ELB", svc.Namespace, svc.Name, svc.OwnerReferences[0].UID, pod.UID)
+				return pod, nil
+			}
+
+			// 检查是否需要更新配置
+			if util.GetHash(conf) != svc.GetAnnotations()[ElbConfigHashKey] {
+				needNetworkNotReady = true
+				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
+				if err != nil {
+					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
+				}
+				servicesToUpdate = append(servicesToUpdate, service)
+			}
+		}
+	}
+
+	// 先创建所有需要创建的Service
+	for _, service := range servicesToCreate {
+		err = c.Create(ctx, service)
+		if err != nil {
 			return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
 		}
 	}
+
+	// 更新所有需要更新的Service
+	for _, service := range servicesToUpdate {
+		err = c.Update(ctx, service)
+		if err != nil {
+			return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
+		}
+	}
+
+	// 如果有Service被更新或创建，说明网络配置发生变化，需要设置网络为NotReady状态
+	if len(servicesToUpdate) > 0 || len(servicesToCreate) > 0 {
+		if needNetworkNotReady && networkStatus != nil {
+			networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
+			pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
+			if err != nil {
+				return pod, cperrors.NewPluginError(cperrors.InternalError, err.Error())
+			}
+		}
+		// 返回，等待下一次reconcile
+		return pod, nil
+	}
+
+	// 处理剩余的未更新Service的状态检查
 	endPoints := ""
 	for i, lbId := range conf.idList[podLbsPorts.index] {
-		// get svc
 		lbName := conf.lbNames[lbId]
 		svc := &corev1.Service{}
 		err = c.Get(ctx, types.NamespacedName{
@@ -249,35 +297,10 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 			Namespace: pod.GetNamespace(),
 		}, svc)
 		if err != nil {
-			if errors.IsNotFound(err) {
-				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
-				if err != nil {
-					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
-				}
-				return pod, cperrors.ToPluginError(c.Create(ctx, service), cperrors.ApiCallError)
+			if !errors.IsNotFound(err) {
+				return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
 			}
-			return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
-		}
-
-		// old svc remain
-		if svc.OwnerReferences[0].Kind == "Pod" && svc.OwnerReferences[0].UID != pod.UID {
-			log.Infof("[%s] waitting old svc %s/%s deleted. old owner pod uid is %s, but now is %s", "HwCloud-ELB", svc.Namespace, svc.Name, svc.OwnerReferences[0].UID, pod.UID)
-			return pod, nil
-		}
-
-		// update svc
-		if util.GetHash(conf) != svc.GetAnnotations()[ElbConfigHashKey] {
-			log.Infof("更新svc：%v", svc.Name)
-			networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
-			pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
-			if err != nil {
-				return pod, cperrors.NewPluginError(cperrors.InternalError, err.Error())
-			}
-			service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
-			if err != nil {
-				return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
-			}
-			return pod, cperrors.ToPluginError(c.Update(ctx, service), cperrors.ApiCallError)
+			continue
 		}
 
 		// disable network
