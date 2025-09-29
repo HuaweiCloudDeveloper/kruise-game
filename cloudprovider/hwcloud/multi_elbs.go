@@ -517,9 +517,12 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 		processedHealthCheckConfig, err := processHealthCheckOptions(conf.lbHealthCheckConfig, podLbsPorts)
 		if err != nil {
 			log.Warningf("[%s] failed to process health check options: %v", MultiElbsNetwork, err)
-			svcAnnotations[ElbHealthCheckOptionsAnnotationKey] = conf.lbHealthCheckConfig
-		} else {
+			// On error, don't set the health check annotation
+		} else if processedHealthCheckConfig != "" {
 			svcAnnotations[ElbHealthCheckOptionsAnnotationKey] = processedHealthCheckConfig
+		} else {
+			log.Warningf("[%s] Health check options processing returned empty result, skipping health check annotation", MultiElbsNetwork)
+			// processedHealthCheckConfig is empty, so don't set the annotation
 		}
 	}
 
@@ -705,92 +708,80 @@ func processHealthCheckOptions(healthCheckConfig string, podLbsPorts *lbsPorts) 
 		return "", fmt.Errorf("failed to unmarshal health check options: %v", err)
 	}
 
-	// Update target_service_port based on pod_target_port mapping
-	for i := range healthCheckOptions {
-		podTargetPortStr := healthCheckOptions[i].PodTargetPort
-		var originalPortStr, protocol string
-
-		if podTargetPortStr != "" {
-			// Process pod_target_port field
-			parts := strings.Split(podTargetPortStr, ":")
+	// Process health check options that have pod_target_port field and filter them
+	var processedOptions []HealthCheckOption
+	for _, option := range healthCheckOptions {
+		if option.PodTargetPort != "" {
+			// Process entries that have pod_target_port field
+			parts := strings.Split(option.PodTargetPort, ":")
 			if len(parts) != 2 {
-				log.Warningf("Invalid pod_target_port format: %s", podTargetPortStr)
-				continue
+				log.Warningf("Invalid pod_target_port format: %s", option.PodTargetPort)
+				return "", nil // Return empty string to indicate health check should not be applied
 			}
-			protocol = parts[0]
-			originalPortStr = parts[1]
-		} else if healthCheckOptions[i].TargetServicePort != "" {
-			// Process existing target_service_port field as fallback
-			targetPortStr := healthCheckOptions[i].TargetServicePort
-			parts := strings.Split(targetPortStr, ":")
-			if len(parts) != 2 {
-				log.Warningf("Invalid target_service_port format: %s", targetPortStr)
-				continue
+			protocol := parts[0]
+			originalPortStr := parts[1]
+
+			// Convert the port part to integer to match with pod ports
+			podPort, err := strconv.Atoi(originalPortStr)
+			if err != nil {
+				log.Warningf("Invalid port number in pod_target_port: %s", originalPortStr)
+				return "", nil // Return empty string to indicate health check should not be applied
 			}
-			protocol = parts[0]
-			originalPortStr = parts[1]
-		} else {
-			// No port configuration found
-			continue
-		}
 
-		// Convert the port part to integer to match with pod ports
-		podPort, err := strconv.Atoi(originalPortStr)
-		if err != nil {
-			log.Warningf("Invalid port number in port specification: %s", originalPortStr)
-			continue
-		}
+			// Look for the corresponding service port based on the pod port and protocol
+			found := false
 
-		// Look for the corresponding service port based on the pod port and protocol
-		found := false
+			// First, look for exact pod port and protocol match
+			for j, targetPodPort := range podLbsPorts.targetPort {
+				if targetPodPort == podPort && j < len(podLbsPorts.protocols) {
+					serviceProtocol := strings.ToUpper(string(podLbsPorts.protocols[j]))
 
-		// First, look for exact pod port and protocol match
-		for j, targetPodPort := range podLbsPorts.targetPort {
-			if targetPodPort == podPort && j < len(podLbsPorts.protocols) {
-				serviceProtocol := strings.ToUpper(string(podLbsPorts.protocols[j]))
-
-				// Handle TCPUDP protocol case
-				if serviceProtocol == "TCPUDP" {
-					// For TCPUDP, the same service port can handle both TCP and UDP protocols
-					servicePort := podLbsPorts.ports[j]
-					// Set the target_service_port to use the actual service port
-					healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
-					// Clear the pod_target_port as it's not needed in the service annotation
-					healthCheckOptions[i].PodTargetPort = ""
-					found = true
-					break
-				} else if serviceProtocol == protocol {
-					// Exact protocol match
-					servicePort := podLbsPorts.ports[j]
-					// Set the target_service_port to use the actual service port
-					healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
-					// Clear the pod_target_port as it's not needed in the service annotation
-					healthCheckOptions[i].PodTargetPort = ""
-					found = true
-					break
+					// Handle TCPUDP protocol case
+					if serviceProtocol == "TCPUDP" {
+						// For TCPUDP, the same service port can handle both TCP and UDP protocols
+						servicePort := podLbsPorts.ports[j]
+						// Create a new option with the updated target_service_port
+						newOption := option
+						newOption.TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+						// Clear the pod_target_port as it's not needed in the service annotation
+						newOption.PodTargetPort = ""
+						processedOptions = append(processedOptions, newOption)
+						found = true
+						break
+					} else if serviceProtocol == protocol {
+						// Exact protocol match
+						servicePort := podLbsPorts.ports[j]
+						// Create a new option with the updated target_service_port
+						newOption := option
+						newOption.TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+						// Clear the pod_target_port as it's not needed in the service annotation
+						newOption.PodTargetPort = ""
+						processedOptions = append(processedOptions, newOption)
+						found = true
+						break
+					}
 				}
 			}
-		}
 
-		// If no exact match found, try index-based mapping as fallback
-		if !found && podPort > 0 && podPort <= len(podLbsPorts.targetPort) {
-			// Use the port as 1-based index to select service port
-			servicePort := podLbsPorts.ports[podPort-1]
-			healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
-			// Clear the pod_target_port as it's not needed in the service annotation
-			if podTargetPortStr != "" {
-				healthCheckOptions[i].PodTargetPort = ""
+			if !found {
+				log.Warningf("pod_target_port %s does not match any port in GSS PortProtocols, health check will be skipped", option.PodTargetPort)
 			}
-			found = true
-		}
 
-		if !found {
-			log.Warningf("Could not find matching service port for port: %s", podTargetPortStr)
+		} else {
+			// Only warn about health check options without pod_target_port
+			log.Warningf("[%s] Found health check option without pod_target_port field, this health check will be ignored: %+v", MultiElbsNetwork, option)
+			// Skip processing this health check option
 		}
 	}
 
-	// Marshal the updated health check options
-	updatedConfig, err := json.Marshal(healthCheckOptions)
+	// Check if we have any processed health check options
+	if len(processedOptions) == 0 {
+		log.Warningf("[%s] No valid health check options with pod_target_port found after processing, health check configuration will not be applied", MultiElbsNetwork)
+		return "", nil // Return empty string to indicate health check should not be applied
+	}
+
+	// Marshal the processed health check options
+	updatedConfig, err := json.Marshal(processedOptions)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal updated health check options: %v", err)
 	}
