@@ -77,6 +77,17 @@ var (
 		ElbIdAnnotationKey:                 {},
 		ElbHealthCheckOptionsAnnotationKey: {},
 	}
+
+	multiElbsControlledAnnotationKeys = []string{
+		ElbIdAnnotationKey,
+		ElbConfigHashKey,
+		ElbHealthCheckFlagAnnotationKey,
+		ElbHealthCheckOptionsAnnotationKey,
+		LBIDBelongIndexKey,
+		ElbMappingPoolAnnotationKey,
+		ElbClassAnnotationKey,
+		ElbPortMappingResultCount,
+	}
 )
 
 type MultiElbsPlugin struct {
@@ -136,11 +147,16 @@ func initMultiLBCache(svcList []corev1.Service, maxPort, minPort int32, blockPor
 		if err != nil {
 			continue
 		}
+		if index < 0 {
+			continue
+		}
 		lenCache := len(cache)
 		for i := lenCache; i <= index; i++ {
 			cacheLevel := make([]bool, int(maxPort-minPort)+1)
 			for _, p := range blockPorts {
-				cacheLevel[int(p-minPort)] = true
+				if cacheIndex, ok := getCacheIndex(p, minPort, maxPort); ok {
+					cacheLevel[cacheIndex] = true
+				}
 			}
 			cache = append(cache, cacheLevel)
 		}
@@ -149,7 +165,9 @@ func initMultiLBCache(svcList []corev1.Service, maxPort, minPort int32, blockPor
 		protocols := make([]corev1.Protocol, 0)
 		targetPorts := make([]int, 0)
 		for _, port := range svc.Spec.Ports {
-			cache[index][(port.Port - minPort)] = true
+			if cacheIndex, ok := getCacheIndex(port.Port, minPort, maxPort); ok {
+				cache[index][cacheIndex] = true
+			}
 			ports = append(ports, port.Port)
 			protocols = append(protocols, port.Protocol)
 			targetPorts = append(targetPorts, port.TargetPort.IntValue())
@@ -159,16 +177,37 @@ func initMultiLBCache(svcList []corev1.Service, maxPort, minPort int32, blockPor
 		if podAllocate[nsName] == nil {
 			podAllocate[nsName] = &lbsPorts{
 				index:      index,
-				lbIds:      []string{svc.Labels[ElbIdAnnotationKey]},
+				lbIds:      []string{svc.Annotations[ElbIdAnnotationKey]},
 				ports:      ports,
 				protocols:  protocols,
 				targetPort: targetPorts,
 			}
 		} else {
-			podAllocate[nsName].lbIds = append(podAllocate[nsName].lbIds, svc.Labels[ElbIdAnnotationKey])
+			podAllocate[nsName].lbIds = append(podAllocate[nsName].lbIds, svc.Annotations[ElbIdAnnotationKey])
 		}
 	}
 	return podAllocate, cache
+}
+
+func getCacheIndex(port, minPort, maxPort int32) (int, bool) {
+	if port < minPort || port > maxPort {
+		return 0, false
+	}
+	return int(port - minPort), true
+}
+
+func (m *MultiElbsPlugin) setCachePortUsed(level int, port int32, used bool) {
+	if level < 0 || level >= len(m.cache) {
+		return
+	}
+	cacheIndex, ok := getCacheIndex(port, m.minPort, m.maxPort)
+	if !ok {
+		return
+	}
+	if cacheIndex < 0 || cacheIndex >= len(m.cache[level]) {
+		return
+	}
+	m.cache[level][cacheIndex] = used
 }
 
 func (m *MultiElbsPlugin) OnPodAdded(c client.Client, pod *corev1.Pod, ctx context.Context) (*corev1.Pod, cperrors.PluginError) {
@@ -217,7 +256,12 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 	}
 
 	// Collect services that need to be updated
-	var servicesToUpdate []*corev1.Service
+	type svcUpdate struct {
+		current *corev1.Service
+		desired *corev1.Service
+	}
+
+	var servicesToUpdate []svcUpdate
 	var servicesToCreate []*corev1.Service
 	var needNetworkNotReady bool
 
@@ -241,19 +285,22 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 			}
 		} else {
 			// old svc remain
-			if svc.OwnerReferences[0].Kind == "Pod" && svc.OwnerReferences[0].UID != pod.UID {
-				log.Infof("[%s] waiting old svc %s/%s deleted. old owner pod uid is %s, but now is %s", "HwCloud-ELB", svc.Namespace, svc.Name, svc.OwnerReferences[0].UID, pod.UID)
+			if len(svc.OwnerReferences) > 0 && svc.OwnerReferences[0].Kind == "Pod" && svc.OwnerReferences[0].UID != pod.UID {
+				log.Infof("[%s] waiting old svc %s/%s deleted. old owner pod uid is %s, but now is %s", MultiElbsNetwork, svc.Namespace, svc.Name, svc.OwnerReferences[0].UID, pod.UID)
 				return pod, nil
 			}
 
 			// Check if configuration update is needed
 			if util.GetHash(conf) != svc.GetAnnotations()[ElbConfigHashKey] {
 				needNetworkNotReady = true
-				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
+				desired, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
 				if err != nil {
 					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
 				}
-				servicesToUpdate = append(servicesToUpdate, service)
+				servicesToUpdate = append(servicesToUpdate, svcUpdate{
+					current: svc,
+					desired: desired,
+				})
 			}
 		}
 	}
@@ -271,8 +318,9 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 	}
 
 	// Update all services that need to be updated
-	for _, service := range servicesToUpdate {
-		err = c.Update(ctx, service)
+	for _, update := range servicesToUpdate {
+		applyMultiElbsServiceUpdate(update.current, update.desired)
+		err = c.Update(ctx, update.current)
 		if err != nil {
 			return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
 		}
@@ -399,7 +447,7 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 }
 
 func (m *MultiElbsPlugin) OnPodDeleted(c client.Client, pod *corev1.Pod, ctx context.Context) cperrors.PluginError {
-	log.Infof("执行OnPodDeleted：%s/%s", pod.GetNamespace(), pod.GetName())
+	log.Infof("[%s] on pod deleted: %s/%s", MultiElbsNetwork, pod.GetNamespace(), pod.GetName())
 	networkManager := utils.NewNetworkManager(pod, c)
 	networkConfig := networkManager.GetNetworkConfig()
 	sc, err := parseMultiELBsConfig(networkConfig)
@@ -418,12 +466,14 @@ func (m *MultiElbsPlugin) OnPodDeleted(c client.Client, pod *corev1.Pod, ctx con
 			return nil
 		}
 		// gss not exists in cluster, deAllocate all the ports related to it.
+		m.mutex.RLock()
 		for key := range m.podAllocate {
 			gssName := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
 			if strings.Contains(key, pod.GetNamespace()+"/"+gssName) {
 				podKeys = append(podKeys, key)
 			}
 		}
+		m.mutex.RUnlock()
 	} else {
 		podKeys = append(podKeys, pod.GetNamespace()+"/"+pod.GetName())
 	}
@@ -431,7 +481,7 @@ func (m *MultiElbsPlugin) OnPodDeleted(c client.Client, pod *corev1.Pod, ctx con
 	for _, podKey := range podKeys {
 		m.deAllocate(podKey)
 	}
-	log.Infof("完成OnPodDeleted：%s/%s", pod.GetNamespace(), pod.GetName())
+	log.Infof("[%s] on pod deleted completed: %s/%s", MultiElbsNetwork, pod.GetNamespace(), pod.GetName())
 	return nil
 }
 
@@ -456,6 +506,35 @@ type multiELBsConfig struct {
 	userDefine                    string
 	idNums                        int
 	allocateLoadBalancerNodePorts bool
+}
+
+func applyMultiElbsServiceUpdate(current, desired *corev1.Service) {
+	if current == nil || desired == nil {
+		return
+	}
+
+	if current.Labels == nil {
+		current.Labels = make(map[string]string)
+	}
+	current.Labels[ServiceBelongNetworkTypeKey] = MultiElbsNetwork
+
+	if current.Annotations == nil {
+		current.Annotations = make(map[string]string)
+	}
+	for _, key := range multiElbsControlledAnnotationKeys {
+		delete(current.Annotations, key)
+	}
+	for k, v := range desired.Annotations {
+		current.Annotations[k] = v
+	}
+
+	current.OwnerReferences = desired.OwnerReferences
+
+	current.Spec.AllocateLoadBalancerNodePorts = desired.Spec.AllocateLoadBalancerNodePorts
+	current.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
+	current.Spec.Type = desired.Spec.Type
+	current.Spec.Selector = desired.Spec.Selector
+	current.Spec.Ports = desired.Spec.Ports
 }
 
 func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, pod *corev1.Pod, lbName string, c client.Client, ctx context.Context) (*corev1.Service, error) {
@@ -601,7 +680,7 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 			if needsReallocation {
 				// Deallocate current allocation
 				for _, port := range existingLbs.ports {
-					m.cache[existingLbs.index][port-m.minPort] = false
+					m.setCachePortUsed(existingLbs.index, port, false)
 				}
 				delete(m.podAllocate, nsName)
 			} else {
@@ -612,7 +691,7 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 			// Index out of bounds for new configuration - reallocate
 			// Deallocate current allocation
 			for _, port := range existingLbs.ports {
-				m.cache[existingLbs.index][port-m.minPort] = false
+				m.setCachePortUsed(existingLbs.index, port, false)
 			}
 			delete(m.podAllocate, nsName)
 		}
@@ -632,7 +711,9 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 	for i := lenCache; i < len(conf.idList); i++ {
 		cacheLevel := make([]bool, int(m.maxPort-m.minPort)+1)
 		for _, p := range m.blockPorts {
-			cacheLevel[int(p-m.minPort)] = true
+			if cacheIndex, ok := getCacheIndex(p, m.minPort, m.maxPort); ok {
+				cacheLevel[cacheIndex] = true
+			}
 		}
 		m.cache = append(m.cache, cacheLevel)
 	}
@@ -692,7 +773,7 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 		return nil, fmt.Errorf("ElbIdNames configuration have not synced")
 	}
 	for _, port := range ports {
-		m.cache[index][port-m.minPort] = true
+		m.setCachePortUsed(index, port, true)
 	}
 	m.podAllocate[nsName] = &lbsPorts{
 		index:      index,
@@ -802,7 +883,7 @@ func (m *MultiElbsPlugin) deAllocate(nsName string) {
 		return
 	}
 	for _, port := range podLbsPorts.ports {
-		m.cache[podLbsPorts.index][port-m.minPort] = false
+		m.setCachePortUsed(podLbsPorts.index, port, false)
 	}
 	delete(m.podAllocate, nsName)
 
@@ -842,6 +923,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 		switch c.Name {
 		case ElbIdNamesConfigName:
 			for _, ElbIdNamesConfig := range strings.Split(c.Value, ",") {
+				ElbIdNamesConfig = strings.TrimSpace(ElbIdNamesConfig)
 				if ElbIdNamesConfig != "" {
 					// Parse format: {elb-id-0}/{name-0}
 					parts := strings.Split(ElbIdNamesConfig, "/")
@@ -849,8 +931,8 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 						return nil, fmt.Errorf("invalid ElbIdNames %s. You should input as the format {elb-id-0}/{name-0}", c.Value)
 					}
 
-					id := parts[0]
-					name := parts[1]
+					id := strings.TrimSpace(parts[0])
+					name := strings.TrimSpace(parts[1])
 
 					nameNum := nameNums[name]
 					if nameNum >= len(idList) {
@@ -865,6 +947,10 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 			}
 		case PortProtocolsConfigName:
 			for _, pp := range strings.Split(c.Value, ",") {
+				pp = strings.TrimSpace(pp)
+				if pp == "" {
+					return nil, fmt.Errorf("invalid PortProtocols %s", c.Value)
+				}
 				ppSlice := strings.Split(pp, "/")
 				port, err := strconv.Atoi(ppSlice[0])
 				if err != nil {
@@ -894,7 +980,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 			}
 			allocateLoadBalancerNodePorts = v
 		case AllocatePolicyConfigName:
-			allocatePolicy = c.Value
+			allocatePolicy = strings.TrimSpace(c.Value)
 			if allocatePolicy != "default" && allocatePolicy != "balanced" {
 				return nil, fmt.Errorf("invalid AllocatePolicy %s", allocatePolicy)
 			}
