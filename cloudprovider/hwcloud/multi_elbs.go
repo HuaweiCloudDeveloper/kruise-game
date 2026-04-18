@@ -514,7 +514,13 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 	}
 
 	if conf.lbHealthCheckFlag == "on" && conf.lbHealthCheckConfig != "" {
-		svcAnnotations[ElbHealthCheckOptionsAnnotationKey] = conf.lbHealthCheckConfig
+		processedHealthCheckConfig, err := processHealthCheckOptions(conf.lbHealthCheckConfig, podLbsPorts)
+		if err != nil {
+			log.Warningf("[%s] failed to process health check options: %v", MultiElbsNetwork, err)
+			svcAnnotations[ElbHealthCheckOptionsAnnotationKey] = conf.lbHealthCheckConfig
+		} else {
+			svcAnnotations[ElbHealthCheckOptionsAnnotationKey] = processedHealthCheckConfig
+		}
 	}
 
 	svcAnnotations[LBIDBelongIndexKey] = strconv.Itoa(podLbsPorts.index)
@@ -692,6 +698,110 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 	return m.podAllocate[nsName], nil
 }
 
+func processHealthCheckOptions(healthCheckConfig string, podLbsPorts *lbsPorts) (string, error) {
+	var healthCheckOptions []HealthCheckOption
+	err := json.Unmarshal([]byte(healthCheckConfig), &healthCheckOptions)
+	if err != nil {
+		return "", fmt.Errorf("failed to unmarshal health check options: %v", err)
+	}
+
+	// Update target_service_port based on pod_target_port mapping
+	for i := range healthCheckOptions {
+		podTargetPortStr := healthCheckOptions[i].PodTargetPort
+		if podTargetPortStr == "" {
+			// If there is a target_service_port field, try to use that as fallback
+			if healthCheckOptions[i].TargetServicePort != "" {
+				// This means the original config already used target_service_port, so just map it
+				targetPortStr := healthCheckOptions[i].TargetServicePort
+				parts := strings.Split(targetPortStr, ":")
+				if len(parts) == 2 {
+					protocol := parts[0]
+					portStr := parts[1]
+					podPort, err := strconv.Atoi(portStr)
+					if err != nil {
+						log.Warningf("Invalid port number in target_service_port: %s", portStr)
+						continue
+					}
+
+					found := false
+					for j, targetPodPort := range podLbsPorts.targetPort {
+						if targetPodPort == podPort {
+							servicePort := podLbsPorts.ports[j]
+							healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+							found = true
+							break
+						}
+					}
+
+					if !found && podPort > 0 && podPort <= len(podLbsPorts.targetPort) {
+						servicePort := podLbsPorts.ports[podPort-1]
+						healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+						found = true
+					}
+
+					if !found {
+						log.Warningf("Could not find matching service port for target_service_port: %s", targetPortStr)
+					}
+				}
+			}
+			continue // Skip if no pod target port is specified
+		}
+
+		// Parse the pod target port string in format like "TCP:1"
+		parts := strings.Split(podTargetPortStr, ":")
+		if len(parts) != 2 {
+			log.Warningf("Invalid pod_target_port format: %s", podTargetPortStr)
+			continue
+		}
+
+		protocol := parts[0]
+		portStr := parts[1]
+
+		// Convert the port part to integer to match with pod ports
+		podPort, err := strconv.Atoi(portStr)
+		if err != nil {
+			log.Warningf("Invalid port number in pod_target_port: %s", portStr)
+			continue
+		}
+
+		// Look for the corresponding service port based on the pod port
+		found := false
+		for j, targetPodPort := range podLbsPorts.targetPort {
+			if targetPodPort == podPort {
+				servicePort := podLbsPorts.ports[j]
+				// Set the target_service_port to use the actual service port
+				healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+				// Clear the pod_target_port as it's not needed in the service annotation
+				healthCheckOptions[i].PodTargetPort = ""
+				found = true
+				break
+			}
+		}
+
+		// If not found by exact pod port match, try to interpret the port as an index (e.g., "1" meaning first port)
+		if !found && podPort > 0 && podPort <= len(podLbsPorts.targetPort) {
+			// Use the port as 1-based index to select service port
+			servicePort := podLbsPorts.ports[podPort-1]
+			healthCheckOptions[i].TargetServicePort = fmt.Sprintf("%s:%d", protocol, servicePort)
+			// Clear the pod_target_port as it's not needed in the service annotation
+			healthCheckOptions[i].PodTargetPort = ""
+			found = true
+		}
+
+		if !found {
+			log.Warningf("Could not find matching service port for pod_target_port: %s", podTargetPortStr)
+		}
+	}
+
+	// Marshal the updated health check options
+	updatedConfig, err := json.Marshal(healthCheckOptions)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal updated health check options: %v", err)
+	}
+
+	return string(updatedConfig), nil
+}
+
 func (m *MultiElbsPlugin) deAllocate(nsName string) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -706,6 +816,19 @@ func (m *MultiElbsPlugin) deAllocate(nsName string) {
 	delete(m.podAllocate, nsName)
 
 	log.Infof("[%s] pod %s deallocate: lbIds %s ports %v", MultiElbsNetwork, nsName, podLbsPorts.lbIds, podLbsPorts.ports)
+}
+
+// HealthCheckOption represents a single health check configuration
+type HealthCheckOption struct {
+	Protocol          string `json:"protocol"`
+	Delay             string `json:"delay"`
+	Timeout           string `json:"timeout"`
+	MaxRetries        string `json:"max_retries"`
+	PodTargetPort     string `json:"pod_target_port"`     // Field from GSS config
+	TargetServicePort string `json:"target_service_port"` // Field to be used in service annotation
+	MonitorPort       string `json:"monitor_port"`
+	Path              string `json:"path,omitempty"`
+	ExpectedCodes     string `json:"expected_codes,omitempty"`
 }
 
 func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multiELBsConfig, error) {
