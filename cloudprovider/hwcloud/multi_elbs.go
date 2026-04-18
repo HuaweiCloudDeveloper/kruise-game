@@ -267,6 +267,7 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 
 		// update svc
 		if util.GetHash(conf) != svc.GetAnnotations()[ElbConfigHashKey] {
+			log.Infof("更新svc：%v", svc.Name)
 			networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkNotReady
 			pod, err = networkManager.UpdateNetworkStatus(*networkStatus, pod)
 			if err != nil {
@@ -465,6 +466,7 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 		}
 	}
 
+	log.Infof("%v服务的elb id:%v", pod.GetName()+"-"+strings.ToLower(lbName), selectId)
 	svcAnnotations := map[string]string{
 		ElbIdAnnotationKey:              selectId,
 		ElbConfigHashKey:                util.GetHash(conf),
@@ -481,6 +483,7 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 		for k, v := range hwOptions {
 			if _, exists := notAllowedAnnotationKeyMap[k]; !exists {
 				svcAnnotations[k] = v
+				log.Infof("添加注解%v:%v", k, v)
 			} else {
 				log.Warningf("[%s] not allowed annotation key %s in UserDefine", MultiElbsNetwork, k)
 			}
@@ -538,12 +541,12 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 			for _, id := range existingLbs.lbIds {
 				existingLbIdsMap[id] = struct{}{}
 			}
-			
+
 			configLbIdsMap := make(map[string]struct{})
 			for _, id := range conf.idList[existingLbs.index] {
 				configLbIdsMap[id] = struct{}{}
 			}
-			
+
 			// Determine if re-allocation is needed
 			needsReallocation := false
 			if len(existingLbs.lbIds) != len(conf.idList[existingLbs.index]) {
