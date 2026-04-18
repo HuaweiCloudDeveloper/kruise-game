@@ -510,6 +510,7 @@ type multiELBsConfig struct {
 	lbHealthCheckFlag     string
 	lbHealthCheckConfig   string
 	userDefine            string
+	idNums                int
 }
 
 func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, pod *corev1.Pod, lbName string, c client.Client, ctx context.Context) (*corev1.Service, error) {
@@ -569,7 +570,7 @@ func (m *MultiElbsPlugin) consSvc(podLbsPorts *lbsPorts, conf *multiELBsConfig, 
 	svcAnnotations[LBIDBelongIndexKey] = strconv.Itoa(podLbsPorts.index)
 	svcAnnotations[ElbMappingPoolAnnotationKey] = lbName
 	svcAnnotations[ElbClassAnnotationKey] = conf.elbClass
-	svcAnnotations[ElbPortMappingResultCount] = strconv.Itoa(len(podLbsPorts.lbIds) * portProtocolNum)
+	svcAnnotations[ElbPortMappingResultCount] = strconv.Itoa(conf.idNums * portProtocolNum)
 
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -720,6 +721,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 	elbHealthCheckConfig := ""
 	elbHealthCheckFlag := "on"
 	userDefine := ""
+	idNums := 0
 
 	for _, c := range conf {
 		switch c.Name {
@@ -743,6 +745,7 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 					}
 					nameNums[name]++
 					lbNames[id] = name
+					idNums++
 				}
 			}
 		case PortProtocolsConfigName:
@@ -821,5 +824,6 @@ func parseMultiELBsConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) (*multi
 		lbHealthCheckFlag:     elbHealthCheckFlag,
 		lbHealthCheckConfig:   elbHealthCheckConfig,
 		userDefine:            userDefine,
+		idNums:                idNums,
 	}, nil
 }
