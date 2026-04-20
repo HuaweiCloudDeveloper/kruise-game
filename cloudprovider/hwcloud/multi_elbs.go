@@ -19,6 +19,7 @@ package hwcloud
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -31,7 +32,7 @@ import (
 	"github.com/openkruise/kruise-game/cloudprovider/utils"
 	"github.com/openkruise/kruise-game/pkg/util"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -86,7 +87,11 @@ type MultiElbsPlugin struct {
 	cache      [][]bool
 	// podAllocate format {pod ns/name}: -{lbId: xxx-a, port: -8001 -8002} -{lbId: xxx-b, port: -8001 -8002}
 	podAllocate map[string]*lbsPorts
-	mutex       sync.RWMutex
+	// pendingDealloc stores ports that have been freed logically (pod deleted) but must not be reused until
+	// all related Services are actually gone in the API server. This avoids reusing a (lb,port) pair while
+	// Service deletion (and cloud cleanup) is still in progress.
+	pendingDealloc map[string]*pendingDeallocEntry
+	mutex          sync.RWMutex
 }
 
 type lbsPorts struct {
@@ -96,6 +101,13 @@ type lbsPorts struct {
 	targetPort []int
 	protocols  []corev1.Protocol
 }
+
+type pendingDeallocEntry struct {
+	lbs     *lbsPorts
+	svcKeys []types.NamespacedName
+}
+
+var errNoAvailablePorts = errors.New("no available ports found")
 
 func (m *MultiElbsPlugin) Name() string {
 	return MultiElbsNetwork
@@ -112,6 +124,9 @@ func (m *MultiElbsPlugin) Init(c client.Client, options cloudprovider.CloudProvi
 	m.minPort = elbOptions.MinPort
 	m.maxPort = elbOptions.MaxPort
 	m.blockPorts = elbOptions.BlockPorts
+	if m.pendingDealloc == nil {
+		m.pendingDealloc = make(map[string]*pendingDeallocEntry)
+	}
 
 	svcList := &corev1.ServiceList{}
 	err := c.List(ctx, svcList, client.MatchingLabels{ServiceBelongNetworkTypeKey: MultiElbsNetwork})
@@ -211,9 +226,18 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 	}
 
 	podNsName := pod.GetNamespace() + "/" + pod.GetName()
+	// Best-effort drain to avoid pending dealloc growing forever.
+	m.tryDrainPendingDealloc(c, ctx, 1)
 	podLbsPorts, err := m.allocate(conf, podNsName)
 	if err != nil {
-		return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
+		if errors.Is(err, errNoAvailablePorts) {
+			// If there are ports stuck in pendingDealloc and their Services are already gone, free them now.
+			m.tryDrainPendingDealloc(c, ctx, 20)
+			podLbsPorts, err = m.allocate(conf, podNsName)
+		}
+		if err != nil {
+			return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
+		}
 	}
 
 	// Collect services that need to be updated
@@ -230,7 +254,7 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 			Namespace: pod.GetNamespace(),
 		}, svc)
 		if err != nil {
-			if errors.IsNotFound(err) {
+			if k8serrors.IsNotFound(err) {
 				service, err := m.consSvc(podLbsPorts, conf, pod, lbName, c, ctx)
 				if err != nil {
 					return pod, cperrors.ToPluginError(err, cperrors.ParameterError)
@@ -262,7 +286,7 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 	for _, service := range servicesToCreate {
 		err = c.Create(ctx, service)
 		if err != nil {
-			if errors.IsAlreadyExists(err) {
+			if k8serrors.IsAlreadyExists(err) {
 				log.Infof("[%s] service %s/%s already exists, skip creation", MultiElbsNetwork, service.Namespace, service.Name)
 				continue
 			}
@@ -301,7 +325,7 @@ func (m *MultiElbsPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx con
 			Namespace: pod.GetNamespace(),
 		}, svc)
 		if err != nil {
-			if !errors.IsNotFound(err) {
+			if !k8serrors.IsNotFound(err) {
 				return pod, cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
 			}
 			continue
@@ -404,35 +428,141 @@ func (m *MultiElbsPlugin) OnPodDeleted(c client.Client, pod *corev1.Pod, ctx con
 	networkConfig := networkManager.GetNetworkConfig()
 	sc, err := parseMultiELBsConfig(networkConfig)
 	if err != nil {
-		return cperrors.NewPluginError(cperrors.ApiCallError, err.Error())
+		// Never deny Pod DELETE because of plugin errors. Worst case: ports are reclaimed later by restart Init().
+		log.Warningf("[%s] parse config failed on PodDeleted for %s/%s: %v", MultiElbsNetwork, pod.GetNamespace(), pod.GetName(), err)
+		return nil
 	}
 
 	var podKeys []string
 	if sc.isFixed {
 		gss, err := util.GetGameServerSetOfPod(pod, c, ctx)
-		if err != nil && !errors.IsNotFound(err) {
-			return cperrors.ToPluginError(err, cperrors.ApiCallError)
+		if err != nil && !k8serrors.IsNotFound(err) {
+			// Best-effort. Do not block Pod DELETE.
+			log.Warningf("[%s] get gss failed on PodDeleted for %s/%s: %v", MultiElbsNetwork, pod.GetNamespace(), pod.GetName(), err)
+			return nil
 		}
 		// gss exists in cluster, do not deAllocate.
 		if err == nil && gss.GetDeletionTimestamp() == nil {
 			return nil
 		}
 		// gss not exists in cluster, deAllocate all the ports related to it.
+		gssName := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
+		gssKeyPrefix := pod.GetNamespace() + "/" + gssName
+		m.mutex.RLock()
 		for key := range m.podAllocate {
-			gssName := pod.GetLabels()[gamekruiseiov1alpha1.GameServerOwnerGssKey]
-			if strings.Contains(key, pod.GetNamespace()+"/"+gssName) {
+			if strings.Contains(key, gssKeyPrefix) {
 				podKeys = append(podKeys, key)
 			}
 		}
+		m.mutex.RUnlock()
 	} else {
 		podKeys = append(podKeys, pod.GetNamespace()+"/"+pod.GetName())
 	}
 
 	for _, podKey := range podKeys {
-		m.deAllocate(podKey)
+		m.markPendingDealloc(podKey, pod.GetNamespace(), strings.TrimPrefix(podKey, pod.GetNamespace()+"/"), sc)
 	}
 	log.Infof("完成OnPodDeleted：%s/%s", pod.GetNamespace(), pod.GetName())
 	return nil
+}
+
+func (m *MultiElbsPlugin) markPendingDealloc(podKey, namespace, podName string, conf *multiELBsConfig) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.pendingDealloc == nil {
+		m.pendingDealloc = make(map[string]*pendingDeallocEntry)
+	}
+
+	// If the pod currently holds an allocation, move it to pendingDealloc.
+	podLbsPorts := m.podAllocate[podKey]
+	if podLbsPorts == nil {
+		return
+	}
+
+	svcKeys := make([]types.NamespacedName, 0, len(podLbsPorts.lbIds))
+	for _, lbId := range podLbsPorts.lbIds {
+		lbName := conf.lbNames[lbId]
+		if lbName == "" {
+			continue
+		}
+		svcKeys = append(svcKeys, types.NamespacedName{
+			Namespace: namespace,
+			Name:      podName + "-" + strings.ToLower(lbName),
+		})
+	}
+
+	m.pendingDealloc[podKey] = &pendingDeallocEntry{
+		lbs:     podLbsPorts,
+		svcKeys: svcKeys,
+	}
+	delete(m.podAllocate, podKey)
+
+	log.Infof("[%s] pod %s marked pending dealloc: lbIds %v ports %v", MultiElbsNetwork, podKey, podLbsPorts.lbIds, podLbsPorts.ports)
+}
+
+func (m *MultiElbsPlugin) tryDrainPendingDealloc(c client.Client, ctx context.Context, maxKeys int) {
+	if maxKeys <= 0 {
+		return
+	}
+
+	// Snapshot up to maxKeys pending entries under lock. Do NOT hold the lock across API calls.
+	keys := make([]string, 0, maxKeys)
+	entries := make([]*pendingDeallocEntry, 0, maxKeys)
+	m.mutex.RLock()
+	for k, v := range m.pendingDealloc {
+		keys = append(keys, k)
+		entries = append(entries, v)
+		if len(keys) >= maxKeys {
+			break
+		}
+	}
+	m.mutex.RUnlock()
+
+	if len(keys) == 0 {
+		return
+	}
+
+	for i, key := range keys {
+		entry := entries[i]
+		if key == "" || entry == nil || entry.lbs == nil {
+			continue
+		}
+		// Without svcKeys we can't reliably verify Service deletion; keep it pending to be safe.
+		if len(entry.svcKeys) == 0 {
+			continue
+		}
+
+		allGone := true
+		for _, svcKey := range entry.svcKeys {
+			svc := &corev1.Service{}
+			if err := c.Get(ctx, svcKey, svc); err != nil {
+				if k8serrors.IsNotFound(err) {
+					continue
+				}
+				// Best-effort: treat transient errors as "still exists" to be safe.
+				allGone = false
+				break
+			}
+			allGone = false
+			break
+		}
+		if !allGone {
+			continue
+		}
+
+		// Finalize deallocation under lock (ensure entry still exists).
+		m.mutex.Lock()
+		current := m.pendingDealloc[key]
+		if current != nil && current.lbs != nil {
+			for _, port := range current.lbs.ports {
+				m.cache[current.lbs.index][port-m.minPort] = false
+			}
+			delete(m.pendingDealloc, key)
+			log.Infof("[%s] pod %s drained pending dealloc: lbIds %v ports %v", MultiElbsNetwork, key, current.lbs.lbIds, current.lbs.ports)
+		}
+		m.mutex.Unlock()
+	}
 }
 
 func init() {
@@ -565,6 +695,15 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 		return nil, cperrors.NewPluginError(cperrors.ApiCallError, "podAllocate is nil")
 	}
 
+	// If the same-name Pod is recreated quickly, reuse the pending allocation to avoid leaks/reallocation.
+	if m.pendingDealloc != nil {
+		if entry, ok := m.pendingDealloc[nsName]; ok && entry != nil && entry.lbs != nil {
+			m.podAllocate[nsName] = entry.lbs
+			delete(m.pendingDealloc, nsName)
+			return entry.lbs, nil
+		}
+	}
+
 	// check if pod is already allocated
 	if m.podAllocate[nsName] != nil {
 		existingLbs := m.podAllocate[nsName]
@@ -672,7 +811,7 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 			}
 		}
 		if maxAvailable < needNum {
-			return nil, fmt.Errorf("no available ports found")
+			return nil, fmt.Errorf("%w", errNoAvailablePorts)
 		}
 		ports = make([]int32, 0)
 		for j := 0; j < len(m.cache[index]); j++ {
@@ -686,7 +825,7 @@ func (m *MultiElbsPlugin) allocate(conf *multiELBsConfig, nsName string) (*lbsPo
 	}
 
 	if index == -1 {
-		return nil, fmt.Errorf("no available ports found")
+		return nil, fmt.Errorf("%w", errNoAvailablePorts)
 	}
 	if index >= len(conf.idList) {
 		return nil, fmt.Errorf("ElbIdNames configuration have not synced")
@@ -799,12 +938,16 @@ func (m *MultiElbsPlugin) deAllocate(nsName string) {
 
 	podLbsPorts := m.podAllocate[nsName]
 	if podLbsPorts == nil {
+		// In case caller tries to deallocate a pending key, ignore.
 		return
 	}
 	for _, port := range podLbsPorts.ports {
 		m.cache[podLbsPorts.index][port-m.minPort] = false
 	}
 	delete(m.podAllocate, nsName)
+	if m.pendingDealloc != nil {
+		delete(m.pendingDealloc, nsName)
+	}
 
 	log.Infof("[%s] pod %s deallocate: lbIds %s ports %v", MultiElbsNetwork, nsName, podLbsPorts.lbIds, podLbsPorts.ports)
 }

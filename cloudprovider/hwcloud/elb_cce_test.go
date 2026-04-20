@@ -50,7 +50,7 @@ var (
 			Name:      "test-pod-0",
 			Namespace: "default",
 			Annotations: map[string]string{
-				"game.kruise.io/network-config-hash":         "2536262647",
+				"game.kruise.io/network-config-hash":         "2515525693",
 				"kubernetes.io/elb.class":                    "performance",
 				"kubernetes.io/elb.connection-drain-enable":  "true",
 				"kubernetes.io/elb.connection-drain-timeout": "300",
@@ -121,7 +121,10 @@ func TestAllocateDeAllocate(t *testing.T) {
 		num:    3,
 	}
 
-	lbId, ports := test.elb.allocate(test.lbIds, test.num, test.podKey)
+	lbId, ports, err := test.elb.allocate(test.lbIds, test.num, test.podKey, false)
+	if err != nil {
+		t.Fatalf("allocate failed: %v", err)
+	}
 	if _, exist := test.elb.podAllocate[test.podKey]; !exist {
 		t.Errorf("podAllocate[%s] is empty after allocated", test.podKey)
 	}
