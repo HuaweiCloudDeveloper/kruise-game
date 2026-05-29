@@ -38,6 +38,8 @@ import (
 
 	gamekruiseiov1alpha1 "github.com/openkruise/kruise-game/apis/v1alpha1"
 	"github.com/openkruise/kruise-game/cloudprovider/errors"
+	cloudproviderutils "github.com/openkruise/kruise-game/cloudprovider/utils"
+	"github.com/openkruise/kruise-game/pkg/util"
 )
 
 var (
@@ -357,6 +359,14 @@ func TestElbPlugin_OnPodUpdated(t *testing.T) {
 			},
 		},
 	}
+	readySvcHash := func() string {
+		networkManager := cloudproviderutils.NewNetworkManager(fakePodTemplate.DeepCopy(), nil)
+		sc, err := parseCCELbConfig(networkManager.GetNetworkConfig())
+		if err != nil {
+			t.Fatalf("parse fake pod network config failed: %v", err)
+		}
+		return util.GetHash(sc)
+	}()
 	tests := []struct {
 		name   string
 		fields fields
@@ -407,8 +417,10 @@ func TestElbPlugin_OnPodUpdated(t *testing.T) {
 			setup: func(clientMock *MockClient) {
 				clientMock.On("Get", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 					service := args[2].(*corev1.Service)
-					*service = fakeSvcTemplate
+					*service = *fakeSvcTemplate.DeepCopy()
+					service.Annotations[ElbConfigHashKey] = readySvcHash
 				}).Return(nil)
+				clientMock.On("Update", mock.Anything, mock.Anything).Return(nil)
 			},
 			want: func() *corev1.Pod {
 				res := fakePodTemplate.DeepCopy()
